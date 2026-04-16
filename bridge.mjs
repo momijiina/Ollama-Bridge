@@ -12,7 +12,7 @@ function flag(name, fallback) {
   return i !== -1 && i + 1 < args.length ? args[i + 1] : fallback;
 }
 
-const OLLAMA_HOST = flag("--ollama-host", "127.0.0.1");
+const OLLAMA_HOST = flag("--ollama-host", "0.0.0.0");
 const OLLAMA_PORT = Number(flag("--ollama-port", "11434"));
 const LMSTUDIO_BASE = flag("--lmstudio-url", "http://127.0.0.1:1234");
 
@@ -50,6 +50,11 @@ function ollamaTimestamp() {
   return new Date().toISOString();
 }
 
+/** Strip ":latest" or other tags from model name for LM Studio */
+function toLmModelName(name) {
+  return name.replace(/:latest$/, "");
+}
+
 // ---------------------------------------------------------------------------
 // Route: GET / — health check
 // ---------------------------------------------------------------------------
@@ -74,9 +79,12 @@ async function handleTags(_req, res) {
   try {
     const r = await lmFetch("/v1/models");
     const body = await r.json();
-    const models = (body.data || []).map((m) => ({
-      name: m.id,
-      model: m.id,
+    const models = (body.data || []).map((m) => {
+      // Ollama uses "name:tag" format — add ":latest" if no tag present
+      const name = m.id.includes(":") ? m.id : `${m.id}:latest`;
+      return {
+      name,
+      model: name,
       modified_at: ollamaTimestamp(),
       size: 0,
       digest: "0000000000000000",
@@ -88,7 +96,8 @@ async function handleTags(_req, res) {
         parameter_size: "",
         quantization_level: "",
       },
-    }));
+    };
+    });
     json(res, 200, { models });
   } catch (e) {
     json(res, 502, { error: `LM Studio unreachable: ${e.message}` });
@@ -101,28 +110,38 @@ async function handleTags(_req, res) {
 async function handleShow(req, res) {
   const data = JSON.parse(await readBody(req));
   const modelName = data.name || data.model || "";
+  const lmModelName = toLmModelName(modelName);
+  console.log(`  show: "${modelName}" → lm:"${lmModelName}"`);
   // Try to find the model in LM Studio's model list
   try {
     const r = await lmFetch("/v1/models");
     const body = await r.json();
-    const found = (body.data || []).find((m) => m.id === modelName);
+    const found = (body.data || []).find((m) => m.id === lmModelName);
     if (!found) {
+      console.log(`  show: NOT FOUND (available: ${(body.data||[]).map(m=>m.id).join(', ')})`);
       json(res, 404, { error: `model '${modelName}' not found` });
       return;
     }
+    console.log(`  show: OK`);
     json(res, 200, {
       modelfile: "",
       parameters: "",
-      template: "",
+      template: "{{ .Prompt }}",
       details: {
         parent_model: "",
         format: "gguf",
-        family: "",
-        families: [],
-        parameter_size: "",
-        quantization_level: "",
+        family: "unknown",
+        families: ["unknown"],
+        parameter_size: "unknown",
+        quantization_level: "unknown",
       },
-      model_info: {},
+      model_info: {
+        "general.architecture": "unknown",
+        "general.file_type": 0,
+        "general.parameter_count": 0,
+        "general.quantization_version": 0,
+      },
+      modified_at: ollamaTimestamp(),
     });
   } catch (e) {
     json(res, 502, { error: `LM Studio unreachable: ${e.message}` });
@@ -136,8 +155,10 @@ async function handleChat(req, res) {
   const data = JSON.parse(await readBody(req));
   const stream = data.stream !== false; // default true
 
+  const lmModel = toLmModelName(data.model);
+
   const openAIBody = {
-    model: data.model,
+    model: lmModel,
     messages: (data.messages || []).map((m) => {
       const msg = { role: m.role, content: m.content };
       if (m.images && m.images.length > 0) {
@@ -291,6 +312,8 @@ async function handleGenerate(req, res) {
   const data = JSON.parse(await readBody(req));
   const stream = data.stream !== false;
 
+  const lmModel = toLmModelName(data.model);
+
   // Convert generate request to chat format via LM Studio
   const messages = [];
   if (data.system) {
@@ -299,7 +322,7 @@ async function handleGenerate(req, res) {
   messages.push({ role: "user", content: data.prompt || "" });
 
   const openAIBody = {
-    model: data.model,
+    model: lmModel,
     messages,
     stream,
   };
@@ -430,7 +453,7 @@ async function handleEmbeddings(req, res) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: data.model,
+        model: toLmModelName(data.model),
         input: Array.isArray(input) ? input : [input],
       }),
     });
@@ -447,6 +470,38 @@ async function handleEmbeddings(req, res) {
       model: data.model,
       embeddings,
     });
+  } catch (e) {
+    json(res, 502, { error: `LM Studio unreachable: ${e.message}` });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /api/ps — list running models
+// ---------------------------------------------------------------------------
+async function handlePs(_req, res) {
+  try {
+    const r = await lmFetch("/v1/models");
+    const body = await r.json();
+    const models = (body.data || []).map((m) => {
+      const name = m.id.includes(":") ? m.id : `${m.id}:latest`;
+      return {
+        name,
+        model: name,
+        size: 0,
+        digest: "0000000000000000",
+        details: {
+          parent_model: "",
+          format: "gguf",
+          family: "unknown",
+          families: ["unknown"],
+          parameter_size: "unknown",
+          quantization_level: "unknown",
+        },
+        expires_at: new Date(Date.now() + 300000).toISOString(),
+        size_vram: 0,
+      };
+    });
+    json(res, 200, { models });
   } catch (e) {
     json(res, 502, { error: `LM Studio unreachable: ${e.message}` });
   }
@@ -485,6 +540,8 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
 
+  console.log(`→ ${req.method} ${path}`);
+
   try {
     // Health & version
     if (path === "/" && req.method === "GET") return handleRoot(req, res);
@@ -493,6 +550,7 @@ const server = http.createServer(async (req, res) => {
 
     // Models
     if (path === "/api/tags" && req.method === "GET") return await handleTags(req, res);
+    if (path === "/api/ps" && req.method === "GET") return await handlePs(req, res);
     if (path === "/api/show" && req.method === "POST") return await handleShow(req, res);
 
     // Generation
