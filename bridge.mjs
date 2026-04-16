@@ -122,17 +122,30 @@ async function handleShow(req, res) {
       json(res, 404, { error: `model '${modelName}' not found` });
       return;
     }
-    console.log(`  show: OK`);
+    console.log(`  show: OK (lm studio model object keys: ${Object.keys(found).join(', ')})`);
+    console.log(`  show: lm studio model data: ${JSON.stringify(found).slice(0, 500)}`);
+
+    // Extract context length from LM Studio model info if available
+    const contextLength = found.context_length
+      || found.max_context_length
+      || found.context_window
+      || found.max_model_len
+      || 131072; // default 128K
 
     // Determine capabilities based on model name
     const capabilities = ["completion"];
     const lowerName = lmModelName.toLowerCase();
     if (lowerName.includes("embed")) {
       capabilities.push("embed");
+    } else {
+      // Non-embedding models support tool calling
+      capabilities.push("tools");
     }
     if (lowerName.includes("vl") || lowerName.includes("vision")) {
       capabilities.push("vision");
     }
+
+    console.log(`  show: capabilities=${JSON.stringify(capabilities)}, contextLength=${contextLength}`);
 
     json(res, 200, {
       model: modelName,
@@ -153,6 +166,8 @@ async function handleShow(req, res) {
         "general.file_type": 0,
         "general.parameter_count": 0,
         "general.quantization_version": 0,
+        "general.context_length": contextLength,
+        "llama.context_length": contextLength,
       },
       capabilities,
       modified_at: ollamaTimestamp(),
