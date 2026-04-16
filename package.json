@@ -1,0 +1,10 @@
+{
+  "name": "ollama-bridge",
+  "version": "1.0.0",
+  "description": "Ollama API to LM Studio (OpenAI-compatible) bridge",
+  "main": "bridge.mjs",
+  "scripts": {
+    "start": "node bridge.mjs"
+  },
+  "type": "module"
+}
