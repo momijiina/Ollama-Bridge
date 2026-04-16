@@ -123,8 +123,21 @@ async function handleShow(req, res) {
       return;
     }
     console.log(`  show: OK`);
+
+    // Determine capabilities based on model name
+    const capabilities = ["completion"];
+    const lowerName = lmModelName.toLowerCase();
+    if (lowerName.includes("embed")) {
+      capabilities.push("embed");
+    }
+    if (lowerName.includes("vl") || lowerName.includes("vision")) {
+      capabilities.push("vision");
+    }
+
     json(res, 200, {
-      modelfile: "",
+      model: modelName,
+      name: modelName,
+      modelfile: `FROM ${lmModelName}`,
       parameters: "",
       template: "{{ .Prompt }}",
       details: {
@@ -141,6 +154,7 @@ async function handleShow(req, res) {
         "general.parameter_count": 0,
         "general.quantization_version": 0,
       },
+      capabilities,
       modified_at: ollamaTimestamp(),
     });
   } catch (e) {
@@ -152,10 +166,13 @@ async function handleShow(req, res) {
 // Route: POST /api/chat — chat completion (streaming & non-streaming)
 // ---------------------------------------------------------------------------
 async function handleChat(req, res) {
-  const data = JSON.parse(await readBody(req));
+  const rawBody = await readBody(req);
+  console.log(`  chat: raw request body (first 500 chars): ${rawBody.slice(0, 500)}`);
+  const data = JSON.parse(rawBody);
   const stream = data.stream !== false; // default true
 
   const lmModel = toLmModelName(data.model);
+  console.log(`  chat: model="${data.model}" → lm:"${lmModel}", stream=${stream}, messages=${(data.messages||[]).length}`);
 
   const openAIBody = {
     model: lmModel,
@@ -198,9 +215,12 @@ async function handleChat(req, res) {
 
     if (!r.ok) {
       const errText = await r.text();
+      console.log(`  chat: LM Studio error ${r.status}: ${errText.slice(0, 300)}`);
       json(res, r.status, { error: errText });
       return;
     }
+
+    console.log(`  chat: LM Studio responded ${r.status}, streaming=${stream}`);
 
     if (!stream) {
       // Non-streaming
