@@ -217,6 +217,10 @@ async function handleChat(req, res) {
     if (data.options.presence_penalty != null) openAIBody.presence_penalty = data.options.presence_penalty;
     if (data.options.top_k != null) openAIBody.top_k = data.options.top_k;
   }
+  // Ensure max_tokens is set to prevent "Response too long" errors
+  if (!openAIBody.max_tokens) {
+    openAIBody.max_tokens = 16384;
+  }
   if (data.keep_alive != null) {
     // No equivalent in OpenAI API — ignore
   }
