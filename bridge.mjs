@@ -2,6 +2,7 @@
 // Usage: node bridge.mjs [--ollama-port 11434] [--lmstudio-url http://localhost:1234]
 
 import http from "node:http";
+import { execSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -15,6 +16,7 @@ function flag(name, fallback) {
 const OLLAMA_HOST = flag("--ollama-host", "0.0.0.0");
 const OLLAMA_PORT = Number(flag("--ollama-port", "11434"));
 const LMSTUDIO_BASE = flag("--lmstudio-url", "http://127.0.0.1:1234");
+const CONTEXT_LENGTH = Number(flag("--context-length", "65536"));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -53,6 +55,43 @@ function ollamaTimestamp() {
 /** Strip ":latest" or other tags from model name for LM Studio */
 function toLmModelName(name) {
   return name.replace(/:latest$/, "");
+}
+
+/** Ensure a model is loaded in LM Studio before making a request */
+const _loadedModels = new Set();
+
+async function ensureModelLoaded(modelName) {
+  // Strip tags like ":latest" for lms CLI compatibility
+  const lmName = toLmModelName(modelName);
+
+  // If we already loaded this model in this session, skip
+  if (_loadedModels.has(lmName)) return;
+
+  // First, try a lightweight check via lms status to see loaded models
+  try {
+    const statusOut = execSync("lms status", { encoding: "utf-8", timeout: 5000 });
+    if (statusOut.includes(lmName)) {
+      _loadedModels.add(lmName);
+      return; // Already loaded
+    }
+  } catch {
+    // lms CLI not available or error — skip
+  }
+
+  console.log(`  auto-load: loading model "${lmName}" via lms CLI (context: ${CONTEXT_LENGTH})...`);
+  try {
+    const out = execSync(`lms load "${lmName}" -y -c ${CONTEXT_LENGTH}`, {
+      encoding: "utf-8",
+      timeout: 120000, // 2 minutes for large models
+    });
+    console.log(`  auto-load: ${out.trim()}`);
+    console.log(`  auto-load: model "${lmName}" loaded successfully`);
+    _loadedModels.add(lmName);
+  } catch (e) {
+    console.log(`  auto-load: lms load failed: ${e.message.slice(0, 300)}`);
+    console.log(`  auto-load: proceeding anyway (LM Studio may JIT-load the model)`);
+    _loadedModels.add(lmName); // Don't retry every request
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,12 +164,12 @@ async function handleShow(req, res) {
     console.log(`  show: OK (lm studio model object keys: ${Object.keys(found).join(', ')})`);
     console.log(`  show: lm studio model data: ${JSON.stringify(found).slice(0, 500)}`);
 
-    // Extract context length from LM Studio model info if available
+    // Extract context length from LM Studio model info if available, or use configured value
     const contextLength = found.context_length
       || found.max_context_length
       || found.context_window
       || found.max_model_len
-      || 131072; // default 128K
+      || CONTEXT_LENGTH;
 
     // Determine capabilities based on model name
     const capabilities = ["completion"];
@@ -217,15 +256,14 @@ async function handleChat(req, res) {
     if (data.options.presence_penalty != null) openAIBody.presence_penalty = data.options.presence_penalty;
     if (data.options.top_k != null) openAIBody.top_k = data.options.top_k;
   }
-  // Ensure max_tokens is set to prevent "Response too long" errors
-  if (!openAIBody.max_tokens) {
-    openAIBody.max_tokens = 16384;
-  }
   if (data.keep_alive != null) {
     // No equivalent in OpenAI API — ignore
   }
 
   try {
+    // Auto-load model if not loaded
+    await ensureModelLoaded(lmModel);
+
     const r = await lmFetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -374,6 +412,9 @@ async function handleGenerate(req, res) {
   }
 
   try {
+    // Auto-load model if not loaded
+    await ensureModelLoaded(lmModel);
+
     const r = await lmFetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -607,13 +648,56 @@ const server = http.createServer(async (req, res) => {
     // Also support /v1/* passthrough for tools that may use OpenAI format directly
     if (path.startsWith("/v1/")) {
       const body = req.method !== "GET" && req.method !== "HEAD" ? await readBody(req) : undefined;
+
+      // Auto-load model for chat/completions/embeddings requests
+      // and inject max_tokens to prevent "Response too long" errors
+      let finalBody = body;
+      if (body && (path.includes("/chat/completions") || path.includes("/completions") || path.includes("/embeddings"))) {
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed.model) {
+            await ensureModelLoaded(parsed.model);
+          }
+        } catch {
+          // ignore parse errors, let the request proceed
+        }
+      }
+
       const r = await lmFetch(path, {
         method: req.method,
         headers: { "Content-Type": "application/json" },
-        ...(body ? { body } : {}),
+        ...(finalBody ? { body: finalBody } : {}),
       });
-      res.writeHead(r.status, { "Content-Type": r.headers.get("content-type") || "application/json" });
+
+      const contentType = r.headers.get("content-type") || "application/json";
+      console.log(`  v1 passthrough: ${path} → ${r.status} (${contentType})`);
+
+      // Stream the response for SSE / streaming chat completions
+      if (path.includes("/chat/completions") && (contentType.includes("text/event-stream") || contentType.includes("octet-stream"))) {
+        res.writeHead(r.status, {
+          "Content-Type": contentType,
+          "Transfer-Encoding": "chunked",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        });
+        const reader = r.body.getReader();
+        const pump = async () => {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(value);
+          }
+        };
+        res.on("close", () => reader.cancel().catch(() => {}));
+        await pump();
+        res.end();
+        return;
+      }
+
+      // Forward all response headers for non-streaming responses
+      res.writeHead(r.status, { "Content-Type": contentType });
       const respBody = await r.text();
+      console.log(`  v1 passthrough: response length=${respBody.length}`);
       res.end(respBody);
       return;
     }
