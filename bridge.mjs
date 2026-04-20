@@ -650,13 +650,36 @@ const server = http.createServer(async (req, res) => {
       const body = req.method !== "GET" && req.method !== "HEAD" ? await readBody(req) : undefined;
 
       // Auto-load model for chat/completions/embeddings requests
-      // and inject max_tokens to prevent "Response too long" errors
       let finalBody = body;
       if (body && (path.includes("/chat/completions") || path.includes("/completions") || path.includes("/embeddings"))) {
         try {
           const parsed = JSON.parse(body);
           if (parsed.model) {
             await ensureModelLoaded(parsed.model);
+          }
+
+          // Log message roles for debugging
+          if (parsed.messages) {
+            const roles = parsed.messages.map(m => m.role);
+            console.log(`  v1 passthrough: messages roles=${JSON.stringify(roles)}`);
+
+            // Ensure there's at least one "user" message for models that require it
+            const hasUser = parsed.messages.some(m => m.role === "user");
+            if (!hasUser && parsed.messages.length > 0) {
+              console.log(`  v1 passthrough: no user message found, converting last non-user message to user role`);
+              // Find the last assistant/system message that has content and convert it
+              for (let i = parsed.messages.length - 1; i >= 0; i--) {
+                if (parsed.messages[i].role !== "system") {
+                  parsed.messages[i].role = "user";
+                  break;
+                }
+              }
+              // If still no user message (all system), add an empty user message
+              if (!parsed.messages.some(m => m.role === "user")) {
+                parsed.messages.push({ role: "user", content: "" });
+              }
+              finalBody = JSON.stringify(parsed);
+            }
           }
         } catch {
           // ignore parse errors, let the request proceed
